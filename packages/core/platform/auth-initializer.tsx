@@ -11,6 +11,7 @@ import {
   initAnalytics,
 } from "../analytics";
 import { configStore } from "../config";
+import { normalizeCommandURL } from "../runtimes/commands";
 import { workspaceListOptions } from "../workspace/queries";
 import { createLogger } from "../logger";
 import { clearClientSessionData } from "./session-cleanup";
@@ -77,10 +78,17 @@ export function AuthInitializer({
           // Absent/false on the managed cloud and older servers → section hidden.
           vcsIntegrationAvailable: cfg.vcs_integration_available === true,
         });
+        // Legacy servers only publish both URLs for self-host. Explicit unknown
+        // or malformed targets stay closed, and absent URLs never imply Cloud.
+        const daemonSetupTarget = cfg.daemon_setup_target ?? (
+          normalizeCommandURL(cfg.daemon_server_url) && normalizeCommandURL(cfg.daemon_app_url)
+            ? "self_host"
+            : "unknown"
+        );
         configStore.getState().setDaemonConfig({
           daemonServerUrl: cfg.daemon_server_url,
           daemonAppUrl: cfg.daemon_app_url,
-          daemonSetupTarget: cfg.daemon_setup_target,
+          daemonSetupTarget,
         });
         configStore.getState().setFeatureFlags(cfg.feature_flags);
         configStore.getState().setServerVersion(cfg.server_version);
