@@ -901,6 +901,21 @@ describe("ApiClient schema fallback", () => {
   });
 
   describe("getConfig", () => {
+    it.each([undefined, null, 123, {}, "unexpected"])(
+      "does not infer Cloud from an unrecognized daemon setup target: %j",
+      async (target) => {
+        stubFetchJson({ cdn_domain: "", daemon_setup_target: target });
+        const config = await new ApiClient("https://api.example.test").getConfig();
+        expect(config.daemon_setup_target).toBe("unknown");
+      },
+    );
+
+    it.each(["cloud", "self_host"])("preserves the confirmed daemon setup target %s", async (target) => {
+      stubFetchJson({ cdn_domain: "", daemon_setup_target: target });
+      const config = await new ApiClient("https://api.example.test").getConfig();
+      expect(config.daemon_setup_target).toBe(target);
+    });
+
     it("drops malformed daemon setup URLs instead of throwing", async () => {
       stubFetchJson({
         cdn_domain: "cdn.example.com",

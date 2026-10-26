@@ -114,6 +114,12 @@ function renderInitializer({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  configStore.setState({
+    daemonConfigStatus: "loading",
+    daemonSetupTarget: "unknown",
+    daemonServerUrl: "",
+    daemonAppUrl: "",
+  });
   __clearDraftCleanupRegistryForTest();
 });
 
@@ -122,6 +128,50 @@ afterEach(() => {
 });
 
 describe("AuthInitializer recovery", () => {
+  it("keeps setup unavailable until a delayed config response confirms the target", async () => {
+    let resolveConfig!: (config: Awaited<ReturnType<ApiClient["getConfig"]>>) => void;
+    const getConfig = vi.fn(() => new Promise<Awaited<ReturnType<ApiClient["getConfig"]>>>(
+      (resolve) => { resolveConfig = resolve; },
+    ));
+    renderInitializer({ api: makeApi({ getConfig }) });
+    expect(configStore.getState().daemonConfigStatus).toBe("loading");
+    expect(configStore.getState().daemonSetupTarget).toBe("unknown");
+    await act(async () => resolveConfig({
+      cdn_domain: "",
+      allow_signup: true,
+      daemon_setup_target: "self_host",
+      daemon_server_url: "https://api.example.com",
+      daemon_app_url: "https://app.example.com",
+    }));
+    expect(configStore.getState()).toMatchObject({
+      daemonConfigStatus: "ready",
+      daemonSetupTarget: "self_host",
+      daemonServerUrl: "https://api.example.com",
+      daemonAppUrl: "https://app.example.com",
+    });
+  });
+
+  it("exposes config failure and recovers the setup target on the existing retry", async () => {
+    vi.useFakeTimers();
+    const getConfig = vi.fn()
+      .mockRejectedValueOnce(new TypeError("network unavailable"))
+      .mockResolvedValue({ daemon_setup_target: "cloud" });
+    renderInitializer({ api: makeApi({ getConfig }) });
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(configStore.getState().daemonConfigStatus).toBe("error");
+    expect(configStore.getState().daemonSetupTarget).toBe("unknown");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000);
+    });
+    expect(getConfig).toHaveBeenCalledTimes(2);
+    expect(configStore.getState()).toMatchObject({
+      daemonConfigStatus: "ready",
+      daemonSetupTarget: "cloud",
+    });
+  });
+
   it("publishes the API origin used by persisted attachment links", async () => {
     const api = makeApi({
       getConfig: vi.fn().mockResolvedValue({

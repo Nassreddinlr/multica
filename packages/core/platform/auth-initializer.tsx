@@ -56,6 +56,7 @@ export function AuthInitializer({
     if (configLoadedRef.current) return Promise.resolve(true);
     if (configRequestRef.current) return configRequestRef.current;
 
+    configStore.getState().setDaemonConfigStatus("loading");
     const request = getApi()
       .getConfig()
       .then((cfg) => {
@@ -79,6 +80,7 @@ export function AuthInitializer({
         configStore.getState().setDaemonConfig({
           daemonServerUrl: cfg.daemon_server_url,
           daemonAppUrl: cfg.daemon_app_url,
+          daemonSetupTarget: cfg.daemon_setup_target,
         });
         configStore.getState().setFeatureFlags(cfg.feature_flags);
         configStore.getState().setServerVersion(cfg.server_version);
@@ -118,7 +120,10 @@ export function AuthInitializer({
         configLoadedRef.current = true;
         return true;
       })
-      .catch(() => false)
+      .catch(() => {
+        configStore.getState().setDaemonConfigStatus("error");
+        return false;
+      })
       .finally(() => {
         configRequestRef.current = null;
       });

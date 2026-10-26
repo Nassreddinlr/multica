@@ -7,9 +7,9 @@ import { TooltipHint } from "@multica/ui/components/common/tooltip-hint";
 import { CODE_LIGATURE_CLASS } from "@multica/ui/lib/code-style";
 import { cn } from "@multica/ui/lib/utils";
 import { copyText } from "@multica/ui/lib/clipboard";
-import { useConfigStore } from "@multica/core/config";
-import { daemonCommands } from "@multica/core/runtimes";
+import { useDaemonSetupCommands } from "@multica/core/runtimes";
 import { CliInstallCommand } from "../../common/cli-install-command";
+import { DaemonSetupNotice } from "../../common/daemon-setup-notice";
 import { useT } from "../../i18n";
 
 function CopyButton({ text }: { text: string }) {
@@ -78,18 +78,9 @@ function Step({
   );
 }
 
-/**
- * CLI install instructions — two copy-and-run commands. Step 1 is the public
- * install script, which differs per OS and so renders through
- * `CliInstallCommand`'s platform switch; step 2 is the setup command, which
- * derives the self-host flags when server/app URLs are configured in runtime
- * config or falls back to cloud `multica setup`.
- */
 export function CliInstallInstructions() {
   const { t } = useT("onboarding");
-  const daemonServerUrl = useConfigStore((s) => s.daemonServerUrl);
-  const daemonAppUrl = useConfigStore((s) => s.daemonAppUrl);
-  const { setupCmd } = daemonCommands(daemonServerUrl, daemonAppUrl);
+  const commands = useDaemonSetupCommands();
 
   return (
     <Card className="w-full">
@@ -109,7 +100,11 @@ export function CliInstallInstructions() {
           </CliInstallCommand>
         </Step>
         <Step n={2} label={t(($) => $.cli_install.step2_label)}>
-          <CommandRow cmd={setupCmd} />
+          {commands.status === "ready" ? (
+            <CommandRow cmd={commands.setupCmd} />
+          ) : (
+            <DaemonSetupNotice status={commands.status} />
+          )}
         </Step>
       </CardContent>
     </Card>
