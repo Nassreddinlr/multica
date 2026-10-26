@@ -3,9 +3,14 @@ import { describe, expect, it } from "vitest";
 import type { AgentTask, TaskUsage } from "@multica/core/types";
 import {
   buildRunTimeline,
+  cacheHitRate,
+  cumulativeCostAt,
   groupRunsByDay,
-  nearestRunIndex,
+  idleSpanAround,
   niceTicks,
+  runIndexAt,
+  shortModelName,
+  stepCurvePath,
   timeTicks,
 } from "./issue-run-timeline";
 
@@ -111,6 +116,51 @@ describe("buildRunTimeline", () => {
     expect(timeline.maxRunCost).toBe(10);
   });
 
+  it("totals cost, tokens and the priciest run over priced runs only", () => {
+    const timeline = buildRunTimeline(
+      [
+        makeTask({ id: "a", usage: usage(400_000) }),
+        makeTask({ id: "b", started_at: "2026-09-24T11:00:00", completed_at: "2026-09-24T11:30:00", usage: usage(200_000) }),
+        makeTask({ id: "unpriced", started_at: "2026-09-24T13:00:00", completed_at: "2026-09-24T13:05:00" }),
+      ],
+      NOW,
+    );
+
+    expect(timeline.totalCost).toBe(15);
+    expect(timeline.pricedCount).toBe(2);
+    expect(timeline.maxRunCost).toBe(10);
+    expect(timeline.tokens).toEqual({ input: 0, output: 600_000, cacheRead: 0, cacheWrite: 0, total: 600_000 });
+  });
+
+  it("splits the spend by agent and by model, largest first", () => {
+    const timeline = buildRunTimeline(
+      [
+        makeTask({ id: "a", agent_id: "agent-a", usage: usage(200_000) }),
+        makeTask({
+          id: "b",
+          agent_id: "agent-b",
+          started_at: "2026-09-24T11:00:00",
+          usage: [
+            ...usage(400_000),
+            // claude-sonnet-5 at 2 / 10: 2M output = $20.
+            { provider: "anthropic", model: "claude-sonnet-5", input_tokens: 0, output_tokens: 2_000_000, cache_read_tokens: 0, cache_write_tokens: 0 },
+          ],
+        }),
+      ],
+      NOW,
+    );
+
+    expect(timeline.costByAgent).toEqual([
+      { key: "agent-b", cost: 30 },
+      { key: "agent-a", cost: 5 },
+    ]);
+    // A run that used two models counts toward each at its own rate.
+    expect(timeline.costByModel).toEqual([
+      { key: "claude-sonnet-5", cost: 20 },
+      { key: "claude-opus-5", cost: 15 },
+    ]);
+  });
+
   it("keeps a run without usage at no figure, not $0", () => {
     const timeline = buildRunTimeline([makeTask({ usage: [] })], NOW);
     expect(timeline.runs[0]!.usage).toBeNull();
@@ -200,7 +250,8 @@ describe("costSoFar", () => {
   });
 });
 
-describe("nearestRunIndex", () => {
+describe("runIndexAt", () => {
+  const MINUTE = 60_000;
   const { runs } = buildRunTimeline(
     [
       makeTask({ id: "a", started_at: "2026-09-24T10:00:00", completed_at: "2026-09-24T10:30:00" }),
@@ -208,16 +259,39 @@ describe("nearestRunIndex", () => {
     ],
     NOW,
   );
-  const at = (iso: string) => runs[nearestRunIndex(runs, new Date(iso).getTime())]!.task.id;
+  const at = (iso: string, slopMs = MINUTE) => {
+    const i = runIndexAt(runs, new Date(iso).getTime(), slopMs);
+    return i < 0 ? null : runs[i]!.task.id;
+  };
 
   it("picks the run under the pointer", () => {
     expect(at("2026-09-24T10:15:00")).toBe("a");
   });
 
-  it("snaps to the nearest bar, however thin, when between runs", () => {
-    expect(at("2026-09-24T11:00:00")).toBe("a");
-    expect(at("2026-09-24T13:00:00")).toBe("b");
-    expect(at("2026-09-25T00:00:00")).toBe("b");
+  it("reaches a sliver of a run within the slop", () => {
+    // `b` lasts 20s; the pointer lands a few pixels — here 40s — off it.
+    expect(at("2026-09-24T13:59:20")).toBe("b");
+    expect(at("2026-09-24T14:01:00")).toBe("b");
+  });
+
+  it("reports no run between runs instead of snapping across the gap", () => {
+    // Review repro (MUL-7780): the crosshair used to jump to whichever run
+    // was nearest, hundreds of pixels from the pointer.
+    expect(at("2026-09-24T11:00:00")).toBeNull();
+    expect(at("2026-09-24T13:00:00")).toBeNull();
+    expect(at("2026-09-25T00:00:00")).toBeNull();
+  });
+
+  it("prefers the run the pointer is inside over one it is merely near", () => {
+    const { runs: adjacent } = buildRunTimeline(
+      [
+        makeTask({ id: "long", started_at: "2026-09-24T10:00:00", completed_at: "2026-09-24T11:00:00" }),
+        makeTask({ id: "blip", started_at: "2026-09-24T11:00:30", completed_at: "2026-09-24T11:00:40" }),
+      ],
+      NOW,
+    );
+    const i = runIndexAt(adjacent, new Date("2026-09-24T10:59:50").getTime(), MINUTE);
+    expect(adjacent[i]!.task.id).toBe("long");
   });
 
   it("reaches a run nested inside a longer one", () => {
@@ -229,7 +303,7 @@ describe("nearestRunIndex", () => {
       ],
       NOW,
     );
-    const pick = (iso: string) => nested[nearestRunIndex(nested, new Date(iso).getTime())]!.task.id;
+    const pick = (iso: string) => nested[runIndexAt(nested, new Date(iso).getTime(), MINUTE)]!.task.id;
     expect(pick("2026-09-24T10:30:00")).toBe("inner");
     expect(pick("2026-09-24T09:30:00")).toBe("outer");
     expect(pick("2026-09-24T11:30:00")).toBe("outer");
@@ -244,12 +318,88 @@ describe("nearestRunIndex", () => {
       NOW,
     );
     const t = new Date("2026-09-24T10:10:00").getTime();
-    expect(lanes[nearestRunIndex(lanes, t)]!.task.id).toBe("lambda");
-    expect(lanes[nearestRunIndex(lanes, t, "agent-emacs")]!.task.id).toBe("emacs");
+    expect(lanes[runIndexAt(lanes, t, MINUTE)]!.task.id).toBe("lambda");
+    expect(lanes[runIndexAt(lanes, t, MINUTE, "agent-emacs")]!.task.id).toBe("emacs");
   });
 
   it("has nothing to point at without runs", () => {
-    expect(nearestRunIndex([], 0)).toBe(-1);
+    expect(runIndexAt([], 0, MINUTE)).toBe(-1);
+  });
+});
+
+describe("cumulativeCostAt", () => {
+  const timeline = buildRunTimeline(
+    [
+      makeTask({ id: "a", started_at: "2026-09-24T10:00:00", completed_at: "2026-09-24T10:30:00", usage: usage(400_000) }),
+      makeTask({ id: "b", started_at: "2026-09-24T11:00:00", completed_at: "2026-09-24T11:30:00", usage: usage(200_000) }),
+    ],
+    NOW,
+  );
+  const at = (iso: string) => cumulativeCostAt(timeline.cumulative, new Date(iso).getTime());
+
+  it("reads the curve: flat until a run finishes, then up by its cost", () => {
+    expect(at("2026-09-24T09:00:00")).toBe(0);
+    // Mid-run nothing has been billed yet — usage lands at completion.
+    expect(at("2026-09-24T10:15:00")).toBe(0);
+    expect(at("2026-09-24T10:30:00")).toBe(10);
+    expect(at("2026-09-24T10:45:00")).toBe(10);
+    expect(at("2026-09-24T12:00:00")).toBe(15);
+  });
+});
+
+describe("idleSpanAround", () => {
+  const { runs } = buildRunTimeline(
+    [
+      makeTask({ id: "a", agent_id: "agent-lambda", started_at: "2026-09-24T10:00:00", completed_at: "2026-09-24T10:30:00" }),
+      makeTask({ id: "b", agent_id: "agent-emacs", started_at: "2026-09-24T11:00:00", completed_at: "2026-09-24T11:10:00" }),
+      makeTask({ id: "c", agent_id: "agent-lambda", started_at: "2026-09-24T12:00:00", completed_at: "2026-09-24T12:30:00" }),
+    ],
+    NOW,
+  );
+  const ms = (iso: string) => new Date(iso).getTime();
+
+  it("spans from the last run's end to the next run's start", () => {
+    expect(idleSpanAround(runs, ms("2026-09-24T10:45:00"))).toEqual({
+      fromMs: ms("2026-09-24T10:30:00"),
+      toMs: ms("2026-09-24T11:00:00"),
+    });
+  });
+
+  it("reads one lane's quiet stretch", () => {
+    expect(idleSpanAround(runs, ms("2026-09-24T10:45:00"), "agent-lambda")).toEqual({
+      fromMs: ms("2026-09-24T10:30:00"),
+      toMs: ms("2026-09-24T12:00:00"),
+    });
+  });
+
+  it("leaves an open side before the first run and after the last", () => {
+    expect(idleSpanAround(runs, ms("2026-09-24T09:00:00")).fromMs).toBeNull();
+    expect(idleSpanAround(runs, ms("2026-09-24T13:00:00")).toMs).toBeNull();
+  });
+});
+
+describe("stepCurvePath", () => {
+  it("rises at each step and holds flat to the right edge", () => {
+    const { line, area } = stepCurvePath(
+      [
+        { t: 250, cost: 5 },
+        { t: 750, cost: 10 },
+      ],
+      [0, 1000],
+      10,
+    );
+    expect(line).toBe("M0,100 L250.00,100.00 L250.00,50.00 L750.00,50.00 L750.00,0.00 L1000,0.00");
+    expect(area).toBe(`${line} L1000,100 L0,100 Z`);
+  });
+});
+
+describe("cacheHitRate", () => {
+  it("is the share of prompt tokens served from cache", () => {
+    expect(cacheHitRate({ input: 100, cacheRead: 800, cacheWrite: 100 })).toBe(0.8);
+  });
+
+  it("has no rate without prompt tokens", () => {
+    expect(cacheHitRate({ input: 0, cacheRead: 0, cacheWrite: 0 })).toBeNull();
   });
 });
 
@@ -310,5 +460,19 @@ describe("groupRunsByDay", () => {
     expect(groups.map((g) => g.runs.map((r) => r.task.id))).toEqual([["d2-a"], ["d1-b", "d1-a"]]);
     expect(groups[1]!.cost).toBe(15);
     expect(groups[1]!.agentMs).toBe(40 * 60 * 1000);
+  });
+});
+
+describe("shortModelName", () => {
+  it("shortens the families it knows", () => {
+    expect(shortModelName("claude-opus-5-5-high")).toBe("Opus 5.5 high");
+    expect(shortModelName("claude-sonnet-4-5-20250929")).toBe("Sonnet 4.5");
+    expect(shortModelName("anthropic/claude-opus-5[1m]")).toBe("Opus 5");
+    expect(shortModelName("gpt-6.1-sol")).toBe("GPT-6.1 Sol");
+    expect(shortModelName("gemini-2.5-pro")).toBe("Gemini 2.5 Pro");
+  });
+
+  it("leaves an unfamiliar id as it is", () => {
+    expect(shortModelName("kimi-k2")).toBe("kimi-k2");
   });
 });

@@ -101,15 +101,25 @@ describe("IssueRunsDialog", () => {
 
     expect(screen.getByRole("heading", { name: "Runs" })).toBeInTheDocument();
     expect(screen.getByText("MUL-7680 · Issue wakeups v2")).toBeInTheDocument();
-    // $25 + $5, 30m + 15m of agent time, first start to last end.
-    const stat = (label: string) => screen.getByText(label).parentElement!;
+    // $25 + $5, 1.2M output tokens, 30m + 15m of agent time over 23h 30m.
+    const stat = (label: string) => screen.getByRole("group", { name: label });
     expect(stat("Spent")).toHaveTextContent("$30.00");
-    expect(stat("Agent time")).toHaveTextContent("45m");
-    expect(stat("Elapsed")).toHaveTextContent("23h 30m");
+    expect(stat("Tokens")).toHaveTextContent("1.2M");
+    expect(stat("Output")).toHaveTextContent("1.2M");
+    expect(stat("Agent time")).toHaveTextContent("45m· 23h 30m elapsed");
     expect(screen.getByText(/1 failed/)).toBeInTheDocument();
     expect(
-      screen.getByRole("img", { name: "Cumulative cost over time: $30.00 across 2 runs" }),
+      screen.getByRole("img", { name: "Run activity: $30.00 across 2 runs" }),
     ).toBeInTheDocument();
+  });
+
+  it("splits the spend by agent and by model", () => {
+    open([makeTask({ usage: [usage()] })]);
+
+    const byModel = screen.getByRole("region", { name: "By model" });
+    expect(within(byModel).getByText("Opus 5")).toBeInTheDocument();
+    expect(within(byModel).getByTitle("claude-opus-5")).toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "By agent" })).getByText("Lambda")).toBeInTheDocument();
   });
 
   it("groups runs by day, newest first, with each day's total", () => {
@@ -121,7 +131,7 @@ describe("IssueRunsDialog", () => {
     const today = screen.getByRole("region", { name: "Today" });
     const yesterday = screen.getByRole("region", { name: "Yesterday" });
     expect(within(today).getByText("Newer run")).toBeInTheDocument();
-    expect(within(today).getByText("1 run · 30m · $25.00")).toBeInTheDocument();
+    expect(within(today).getByText("1 run · 30m · 1M tokens · $25.00")).toBeInTheDocument();
     expect(within(yesterday).getByText("Older run")).toBeInTheDocument();
     expect(
       today.compareDocumentPosition(yesterday) & Node.DOCUMENT_POSITION_FOLLOWING,
@@ -190,29 +200,164 @@ describe("IssueRunsDialog", () => {
     expect(screen.getAllByText("$7.00").length).toBeGreaterThan(0);
   });
 
-  it("answers a pointer anywhere on the chart with the nearest run", () => {
+  // jsdom does not lay out; give the plot a width so pointer x maps to a run.
+  function layOut(plot: HTMLElement) {
+    plot.getBoundingClientRect = () => ({ left: 0, width: 1000, top: 0, height: 200, right: 1000, bottom: 200, x: 0, y: 0, toJSON: () => ({}) });
+  }
+  const plotOf = () => screen.getByRole("img").children[0] as HTMLElement;
+  const hoverCard = (plot: HTMLElement) => plot.querySelector("[data-hover-card]") as HTMLElement | null;
+  const twoRuns = () => [
+    makeTask({ id: "early", trigger_summary: "Early run", started_at: "2026-09-26T09:00:00", completed_at: "2026-09-26T09:30:00", usage: [usage()] }),
+    makeTask({ id: "late", trigger_summary: "Late run", started_at: "2026-09-27T15:00:00", completed_at: "2026-09-27T15:10:00", usage: [usage({ output_tokens: 200_000 })] }),
+  ];
+
+  it("draws one bar per run, oldest first, with days as dividers", () => {
+    open([
+      ...twoRuns(),
+      makeTask({ id: "failed", status: "failed", started_at: "2026-09-27T16:00:00", completed_at: "2026-09-27T16:05:00" }),
+    ]);
+    const plot = plotOf();
+
+    expect(Array.from(plot.querySelectorAll("[data-run]"), (el) => el.getAttribute("data-run"))).toEqual([
+      "early",
+      "late",
+      "failed",
+    ]);
+    // $25 against $5: heights follow cost, and a run with no usage is a stub.
+    const height = (id: string) => (plot.querySelector(`[data-run="${id}"]`) as HTMLElement).style.height;
+    expect(parseFloat(height("early"))).toBeGreaterThan(parseFloat(height("late")));
+    expect(height("failed")).toBe("4px");
+    expect(within(plot).getByText("Sep 26")).toBeInTheDocument();
+    expect(within(plot).getByText("Today")).toBeInTheDocument();
+  });
+
+  it("names the run under the pointer, anywhere in the chart row", () => {
+    open(twoRuns());
+    const chart = screen.getByRole("img");
+    const plot = plotOf();
+    layOut(plot);
+
+    fireEvent.pointerMove(plot, { clientX: 750 });
+    expect(within(hoverCard(plot)!).getByText("Late run")).toBeInTheDocument();
+    expect(within(hoverCard(plot)!).getByText("$5.00")).toBeInTheDocument();
+
+    fireEvent.pointerMove(plot, { clientX: 250 });
+    expect(within(hoverCard(plot)!).getByText("Early run")).toBeInTheDocument();
+
+    // Drifting onto the y scale clamps to the newest run instead of dropping the hover.
+    fireEvent.pointerMove(chart.children[1] as HTMLElement, { clientX: 1030 });
+    expect(within(hoverCard(plot)!).getByText("Late run")).toBeInTheDocument();
+
+    fireEvent.pointerLeave(chart);
+    expect(hoverCard(plot)).not.toBeInTheDocument();
+  });
+
+  it("switches the chart between cost, tokens and agent time", () => {
+    open(twoRuns());
+    const plot = plotOf();
+    layOut(plot);
+
+    fireEvent.click(screen.getByRole("button", { name: "Tokens" }));
+    expect(screen.getByText("per run · by token type")).toBeInTheDocument();
+    // In the token view the hover splits the run's tokens by type.
+    fireEvent.pointerMove(plot, { clientX: 750 });
+    expect(within(hoverCard(plot)!).getByText("Output")).toBeInTheDocument();
+    expect(within(hoverCard(plot)!).getByText("200K")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Agent time" }));
+    expect(screen.getByText("per run · by agent")).toBeInTheDocument();
+  });
+
+  // Review repro (PR #9288): segments used dollar amounts as flex-grow, and
+  // grow factors summing below 1 leave free space unfilled — a $0.10 bar drew
+  // a tenth of its height. jsdom does not lay out, so pin the factors instead.
+  it("splits bars by share, so costs under $1 still fill them", () => {
+    open([
+      makeTask({ id: "a", agent_id: "agent-a", usage: [usage({ output_tokens: 4_000 })] }),
+      makeTask({ id: "b", agent_id: "agent-b", started_at: "2026-09-27T11:00:00", usage: [usage({ output_tokens: 16_000 })] }),
+    ]);
+    const grow = (el: Element) => Number((el as HTMLElement).style.flexGrow);
+
+    const bar = screen.getByRole("img").querySelector('[data-run="a"]')!;
+    expect(Array.from(bar.children, grow)).toEqual([1]);
+
+    // $0.40 and $0.10 of $0.50.
+    const band = within(screen.getByRole("region", { name: "By agent" })).getByText("By agent").nextElementSibling!;
+    expect(Array.from(band.children, grow)).toEqual([0.8, 0.2]);
+
+    const toggle = screen.getAllByRole("button", { name: "Run details" })[0]!;
+    fireEvent.click(toggle);
+    const details = document.getElementById(toggle.getAttribute("aria-controls")!)!;
+    const split = details.querySelector('[aria-hidden="true"]')!;
+    expect(Array.from(split.children, grow)).toEqual([1]);
+  });
+
+  // The cumulative view's x axis is time over the runs' padded span.
+  function layOutTime(plot: HTMLElement, first: string, last: string) {
+    layOut(plot);
+    const [d0, d1] = [new Date(first).getTime(), new Date(last).getTime()];
+    const pad = (d1 - d0) * 0.02;
+    return (iso: string) => ((new Date(iso).getTime() - (d0 - pad)) / (d1 - d0 + 2 * pad)) * 1000;
+  }
+  const showCumulative = () => fireEvent.click(screen.getByRole("button", { name: "Cumulative" }));
+
+  it("keeps the cumulative cost curve as a second view", () => {
+    open(twoRuns());
+    expect(screen.getByRole("button", { name: "Per run" })).toHaveAttribute("aria-pressed", "true");
+
+    showCumulative();
+    expect(screen.getByRole("img", { name: "Cumulative cost over time: $30.00 across 2 runs" })).toBeInTheDocument();
+    expect(screen.getByText("Cumulative cost")).toBeInTheDocument();
+    // The metric switch belongs to the per-run bars.
+    expect(screen.queryByRole("button", { name: "Tokens" })).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Per run" }));
+    expect(screen.getByRole("button", { name: "Tokens" })).toBeInTheDocument();
+  });
+
+  it("follows the pointer: the run under it answers, a gap says so", () => {
     open([
       makeTask({ id: "early", trigger_summary: "Early run", started_at: "2026-09-27T09:00:00", completed_at: "2026-09-27T09:30:00", usage: [usage()] }),
       makeTask({ id: "late", trigger_summary: "Late run", started_at: "2026-09-27T15:00:00", completed_at: "2026-09-27T15:10:00", usage: [usage({ output_tokens: 200_000 })] }),
     ]);
-    // The plot column sits beside the lane labels; give it a width, which
-    // jsdom does not lay out.
+    showCumulative();
     const plot = screen.getByRole("img").children[1] as HTMLElement;
-    plot.getBoundingClientRect = () => ({ left: 0, width: 1000, top: 0, height: 200, right: 1000, bottom: 200, x: 0, y: 0, toJSON: () => ({}) });
+    const x = layOutTime(plot, "2026-09-27T09:00:00", "2026-09-27T15:10:00");
 
-    // Far right, past the last bar: snaps to the last run.
-    fireEvent.pointerMove(plot, { clientX: 995 });
-    expect(within(plot).getByText("Late run")).toBeInTheDocument();
-    expect(within(plot).getByText(/Total so far \$30\.00/)).toBeInTheDocument();
+    fireEvent.pointerMove(plot, { clientX: x("2026-09-27T15:05:00") });
+    expect(within(hoverCard(plot)!).getByText("Late run")).toBeInTheDocument();
+    expect(within(hoverCard(plot)!).getByText(/Total so far \$30\.00/)).toBeInTheDocument();
 
-    // Far left: the first run, with the curve's reading there.
-    fireEvent.pointerMove(plot, { clientX: 5 });
-    expect(within(plot).getByText("Early run")).toBeInTheDocument();
-    expect(within(plot).getByText(/Total so far \$25\.00/)).toBeInTheDocument();
+    // Review repro (MUL-7780): between runs the crosshair used to snap to the
+    // nearest run's end, hundreds of pixels away. Now it stays put and the
+    // card says nothing ran here, for how long, and what was spent by then.
+    fireEvent.pointerMove(plot, { clientX: x("2026-09-27T12:00:00") });
+    const idle = within(hoverCard(plot)!);
+    expect(idle.getByText("No run")).toBeInTheDocument();
+    expect(idle.getByText("09:30 → 15:00 · Idle 5h 30m")).toBeInTheDocument();
+    expect(idle.getByText("Total so far $25.00")).toBeInTheDocument();
+    expect(within(plot).getByText("12:00")).toBeInTheDocument();
 
-    // Leaving hands the plot back to the peak label.
+    fireEvent.pointerMove(plot, { clientX: x("2026-09-27T09:15:00") });
+    expect(within(hoverCard(plot)!).getByText("Early run")).toBeInTheDocument();
+
     fireEvent.pointerLeave(plot);
-    expect(within(plot).queryByText(/Total so far/)).not.toBeInTheDocument();
+    expect(hoverCard(plot)).not.toBeInTheDocument();
+  });
+
+  it("keeps the hover when the pointer drifts off the plot onto the lane labels", () => {
+    open([
+      makeTask({ id: "early", trigger_summary: "Early run", started_at: "2026-09-27T09:00:00", completed_at: "2026-09-27T09:30:00", usage: [usage()] }),
+      makeTask({ id: "late", trigger_summary: "Late run", started_at: "2026-09-27T15:00:00", completed_at: "2026-09-27T15:10:00", usage: [usage()] }),
+    ]);
+    showCumulative();
+    const chart = screen.getByRole("img");
+    const plot = chart.children[1] as HTMLElement;
+    layOutTime(plot, "2026-09-27T09:00:00", "2026-09-27T15:10:00");
+
+    // Left of the plot: clamped to where the runs begin.
+    fireEvent.pointerMove(chart.children[0] as HTMLElement, { clientX: -40 });
+    expect(within(hoverCard(plot)!).getByText("Early run")).toBeInTheDocument();
   });
 
   it("picks the run on the lane under the pointer when runs overlap", () => {
@@ -221,32 +366,30 @@ describe("IssueRunsDialog", () => {
       makeTask({ id: "long", agent_id: "agent-lambda", trigger_summary: "Long run", started_at: "2026-09-27T09:00:00", completed_at: "2026-09-27T12:00:00", usage: [usage()] }),
       makeTask({ id: "short", agent_id: "agent-emacs", trigger_summary: "Short run", started_at: "2026-09-27T10:00:00", completed_at: "2026-09-27T11:00:00", usage: [usage({ output_tokens: 200_000 })] }),
     ]);
+    showCumulative();
     const plot = screen.getByRole("img").children[1] as HTMLElement;
-    plot.getBoundingClientRect = () => ({ left: 0, width: 1000, top: 0, height: 200, right: 1000, bottom: 200, x: 0, y: 0, toJSON: () => ({}) });
+    const x = layOutTime(plot, "2026-09-27T09:00:00", "2026-09-27T12:00:00");
     const lane = (agentId: string) => plot.querySelector(`[data-lane="${agentId}"]`) as HTMLElement;
-    // The x of 10:30 on the chart's padded domain.
-    const [d0, d1] = [new Date("2026-09-27T09:00:00").getTime(), new Date("2026-09-27T12:00:00").getTime()];
-    const pad = (d1 - d0) * 0.02;
-    const x = ((new Date("2026-09-27T10:30:00").getTime() - (d0 - pad)) / (d1 - d0 + 2 * pad)) * 1000;
 
-    fireEvent.pointerMove(lane("agent-lambda"), { clientX: x });
-    expect(within(plot).getByText("Long run")).toBeInTheDocument();
+    fireEvent.pointerMove(lane("agent-lambda"), { clientX: x("2026-09-27T10:30:00") });
+    expect(within(hoverCard(plot)!).getByText("Long run")).toBeInTheDocument();
 
-    fireEvent.pointerMove(lane("agent-emacs"), { clientX: x });
-    expect(within(plot).getByText("Short run")).toBeInTheDocument();
+    fireEvent.pointerMove(lane("agent-emacs"), { clientX: x("2026-09-27T10:30:00") });
+    expect(within(hoverCard(plot)!).getByText("Short run")).toBeInTheDocument();
   });
 
-  it("opens a run's cost split from a real button, not hover alone", () => {
+  it("expands a run's details from a real button", () => {
     open([makeTask({ usage: [usage()] })]);
 
-    // Focusable (keyboard) and clickable (touch); the review found a span.
-    const button = screen.getByRole("button", { name: "Cost breakdown: $25.00" });
-    expect(button).not.toHaveAttribute("tabindex", "-1");
-    expect(screen.queryByText("claude-opus-5")).not.toBeInTheDocument();
+    const toggle = screen.getByRole("button", { name: "Run details" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(document.getElementById(toggle.getAttribute("aria-controls")!)).toBeNull();
 
-    fireEvent.click(button);
-    expect(screen.getByText("claude-opus-5")).toBeInTheDocument();
-    expect(screen.getByText("1M")).toBeInTheDocument();
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    const details = document.getElementById(toggle.getAttribute("aria-controls")!)!;
+    expect(within(details).getByText("claude-opus-5")).toBeInTheDocument();
+    expect(within(details).getByText("Total")).toBeInTheDocument();
   });
 
   it("names a wakeup run by its rule, not as a quote", () => {
